@@ -9,9 +9,24 @@ from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from fastapi.middleware.cors import CORSMiddleware
+
 load_dotenv()
 app = FastAPI()
 
+# CORS 설정
+origins = [
+    "http://localhost:3000",  # 로컬 프론트엔드
+    "https://your-frontend-domain.com",  # 배포된 프론트엔드 도메인
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
