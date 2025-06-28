@@ -361,15 +361,21 @@ async def ingest_fhir(request: FHIRIngestRequest):
                     "days_supply": days_supply,
                 })
 
-                insert_md = supabase.table("medication_dispenses").insert({
-                    "user_id": user_id,
-                    "resource_id": resource_id,
-                    "medication_code": medication_code,
-                    "medication_name": medication_name,
-                    "pharmacy_name": pharmacy_name,
-                    "when_prepared": when_prepared,
-                    "days_supply": days_supply,
-                }).execute()
+                # idempotent: 이미 삽입된 매핑은 건너뜀
+                md_exists = supabase.table("medication_dispenses") \
+                    .select("id") \
+                    .eq("resource_id", resource_id) \
+                    .execute()
+                if not md_exists.data:
+                    supabase.table("medication_dispenses").insert({
+                        "user_id": user_id,
+                        "resource_id": resource_id,
+                        "medication_code": medication_code,
+                        "medication_name": medication_name,
+                        "pharmacy_name": pharmacy_name,
+                        "when_prepared": when_prepared,
+                        "days_supply": days_supply,
+                    }).execute()
             elif resource_type == "ExplanationOfBenefit":
                 claim_type_coding = res.get("type", {}).get("coding", [{}])[0]
                 claim_type = claim_type_coding.get("code") or claim_type_coding.get("display")
@@ -388,14 +394,20 @@ async def ingest_fhir(request: FHIRIngestRequest):
                             copay_amount = val
                         elif code_key == "benefit":
                             benefit_amount = val
-                insert_tc = supabase.table("treatment_claims").insert({
-                    "user_id": user_id,
-                    "resource_id": resource_id,
-                    "claim_type": claim_type,
-                    "created_date": created_date,
-                    "copay_amount": copay_amount,
-                    "benefit_amount": benefit_amount
-                }).execute()
+                # idempotent: 이미 삽입된 매핑은 건너뜀
+                tc_exists = supabase.table("treatment_claims") \
+                    .select("id") \
+                    .eq("resource_id", resource_id) \
+                    .execute()
+                if not tc_exists.data:
+                    supabase.table("treatment_claims").insert({
+                        "user_id": user_id,
+                        "resource_id": resource_id,
+                        "claim_type": claim_type,
+                        "created_date": created_date,
+                        "copay_amount": copay_amount,
+                        "benefit_amount": benefit_amount
+                    }).execute()
             elif resource_type == "Immunization":
                 vc = res.get("vaccineCode", {}).get("coding", [{}])[0]
                 vaccine_name = vc.get("display")
@@ -415,14 +427,20 @@ async def ingest_fhir(request: FHIRIngestRequest):
                     org = actor.get("resource", {})
                     perf_name = org.get("name")
 
-                insert_im = supabase.table("immunizations").insert({
-                    "user_id": user_id,
-                    "resource_id": resource_id,
-                    "vaccine_name": vaccine_name,
-                    "occurrence_date": occurrence_date,
-                    "dose_number": dose_number,
-                    "performer_name": perf_name
-                }).execute()
+                # idempotent: 이미 삽입된 매핑은 건너뜀
+                im_exists = supabase.table("immunizations") \
+                    .select("id") \
+                    .eq("resource_id", resource_id) \
+                    .execute()
+                if not im_exists.data:
+                    supabase.table("immunizations").insert({
+                        "user_id": user_id,
+                        "resource_id": resource_id,
+                        "vaccine_name": vaccine_name,
+                        "occurrence_date": occurrence_date,
+                        "dose_number": dose_number,
+                        "performer_name": perf_name
+                    }).execute()
             else:
                 # 지원하지 않는 리소스 타입은 건너뜀
                 continue
