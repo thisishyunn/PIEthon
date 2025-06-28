@@ -6,10 +6,11 @@ import glob
 from openai import OpenAI
 import json
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
 
 load_dotenv()
 app = FastAPI()
@@ -56,32 +57,142 @@ async def extract_pdf(file: UploadFile = File(...), password: str = Form(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF 처리 중 오류 발생: {str(e)}")
 
-@app.get("/health-report")
-async def health_report():
+@app.post("/health-report")
+async def health_report(files: List[UploadFile] = File(default=None)):
+    """FHIR JSON 파일을 직접 업로드하거나(여러 개 가능) 
+    업로드가 없으면 서버의 fhir/ 디렉터리를 읽어 GPT 건강 보고서를 생성한다."""
+
     try:
-        fhir_dir = os.path.join(os.path.dirname(__file__), "fhir")
-        files = glob.glob(os.path.join(fhir_dir, "*"))
-        if not files:
-            raise HTTPException(status_code=404, detail="FHIR 데이터 파일을 찾을 수 없습니다.")
         combined = ""
-        for file_path in files:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                combined += f.read() + "\n"
-        prompt = f"다음 환자의 FHIR 데이터를 바탕으로 종합적인 건강 보고서를 작성해줘:\n{combined}"
+
+        # 1) 요청으로부터 업로드된 파일이 있는 경우 우선 사용
+        if files:
+            for uf in files:
+                content_bytes = await uf.read()
+                try:
+                    combined += content_bytes.decode("utf-8") + "\n"
+                except UnicodeDecodeError:
+                    raise HTTPException(status_code=400, detail=f"파일 {uf.filename} 은(는) UTF-8 인코딩된 JSON이 아닙니다.")
+
+        # 2) 업로드가 없으면 기존 fhir 디렉터리의 파일 사용
+        if not combined:
+            fhir_dir = os.path.join(os.path.dirname(__file__), "fhir")
+            local_files = glob.glob(os.path.join(fhir_dir, "*"))
+            if not local_files:
+                raise HTTPException(status_code=404, detail="FHIR 데이터 파일을 찾을 수 없습니다.")
+            for file_path in local_files:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    combined += f.read() + "\n"
+
+        # GPT 프롬프트 구성 및 호출
+        prompt = (
+            "다음 환자의 FHIR 데이터를 바탕으로 종합적인 건강 보고서를 작성해주세요\n" + combined
+        )
+
         response = client.chat.completions.create(
             model="o4-mini",
             messages=[
-                {"role": "system", "content": "당신은 의료 보고서 생성 전문가입니다."},
-                {"role": "user", "content": prompt}
-            ]
+                {"role": "system", "content": f"""
+        당신은 FHIR 의료 데이터 분석 전문가입니다. 
+        Plain-Text 형식 리포트를 작성해야 하며 의학적 진단을 대체하지 않는다는
+        고지를 항상 포함합니다. 다음 구조로 리포트를 작성해주세요:
+
+        # ========================================
+        개인 건강 분석 리포트
+
+        분석 기준일: {datetime.now().strftime('%Y년 %m월 %d일')}
+
+        ---
+
+        1. 약물 현황 요약
+
+        ---
+
+        - 현재 복용 추정 약물: X개 (최근 30일 이내 처방 기준)
+        - 중단된 약물: X개
+        - 상태 불분명 약물: X개
+        - 전체 투약 기록: X건
+
+        ---
+
+        1. 약물 상태 분류
+
+        ---
+
+        [현재 복용 중인 약물]
+
+        - 약물명 (성분명) | 처방일 | 복용법
+
+        [중단된 약물]
+
+        - 약물명 (성분명) | 마지막 처방일 | 중단 추정일
+
+        [일시적 처방 약물]
+
+        - 약물명 | 처방 기간 | 용도 추정
+
+        ---
+
+        1. 시간별 약물 변화
+
+        ---
+
+        - 최초 처방: YYYY-MM
+        - 최근 처방: YYYY-MM
+        - 약물 추가 이력: (시기별로 정리)
+        - 약물 중단 이력: (시기별로 정리)
+
+        ---
+
+        1. 건강 상태 추정
+
+        ---
+
+        - 투약 기록으로 추정되는 질환/증상
+        - 만성 질환 관리 현황
+        - 급성 치료 이력
+
+        ---
+
+        1. 의료 이용 패턴
+
+        ---
+
+        - 주요 이용 의료기관/약국
+        - 처방 주기 패턴
+        - 계절별/시기별 특이사항
+
+        ---
+
+        1. 주의사항 및 권장사항
+
+        ---
+
+        - 잠재적 약물 상호작용
+        - 복약 관리 개선점
+        - 의료진 상담 권장 사항
+
+        ========================================
+
+        중요사항:
+
+        - 이 분석은 정보 제공 목적이며 의학적 진단을 대체하지 않습니다
+        - 모든 의약품 관련 결정은 의료진과 상담 후 결정하세요
+        - 응급상황 시에는 즉시 의료기관을 방문하세요
+"""},
+                {"role": "user", "content": prompt},
+            ],
         )
+
         report = response.choices[0].message.content
-        print(report)
         return {"report": report}
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"건강 보고서 생성 중 오류 발생: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"건강 보고서 생성 중 오류 발생: {str(e)}"
+        )
 
 class FHIRIngestRequest(BaseModel):
     name_hash: str
