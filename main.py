@@ -14,6 +14,7 @@ from datetime import datetime
 import pandas as pd
 from io import BytesIO
 from fastapi.responses import StreamingResponse
+import re
 
 load_dotenv()
 app = FastAPI()
@@ -351,6 +352,28 @@ async def ingest_fhir(request: FHIRIngestRequest):
                 print("when_prepared", when_prepared)
                 days_supply = res.get("daysSupply", {}).get("value")
 
+                # 나이 계산 (주민등록번호 앞 7자리 이용)
+                age = None
+                subj = res.get("subject", {})
+                pat = subj.get("resource", {})
+                ident_list = pat.get("identifier", [])
+                rrn_val = None
+                for ident in ident_list:
+                    if ident.get("system") == "http://mois.go.kr/rnn":
+                        rrn_val = ident.get("value", "")
+                        break
+                if rrn_val:
+                    digits = re.sub(r"\D", "", rrn_val)
+                    if len(digits) >= 7:
+                        yy = int(digits[0:2])
+                        mm = int(digits[2:4])
+                        dd = int(digits[4:6])
+                        code = digits[6]
+                        year = 1900 + yy if code in ("1", "2") else 2000 + yy
+                        dob = datetime(year, mm, dd).date()
+                        prep_date = datetime.fromisoformat(when_prepared).date()
+                        age = prep_date.year - dob.year - ((prep_date.month, prep_date.day) < (dob.month, dob.day))
+
                 print({
                     "user_id": user_id,
                     "resource_id": resource_id,
@@ -359,6 +382,7 @@ async def ingest_fhir(request: FHIRIngestRequest):
                     "pharmacy_name": pharmacy_name,
                     "when_prepared": when_prepared,
                     "days_supply": days_supply,
+                    "age": age,
                 })
 
                 # idempotent: 이미 삽입된 매핑은 건너뜀
@@ -375,6 +399,7 @@ async def ingest_fhir(request: FHIRIngestRequest):
                         "pharmacy_name": pharmacy_name,
                         "when_prepared": when_prepared,
                         "days_supply": days_supply,
+                        "age": age,
                     }).execute()
             elif resource_type == "ExplanationOfBenefit":
                 claim_type_coding = res.get("type", {}).get("coding", [{}])[0]
