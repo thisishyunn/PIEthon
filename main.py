@@ -358,6 +358,24 @@ async def clear_data():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"데이터 삭제 오류: {str(e)}")
 
+# PROResponse 모델 및 /pro-responses 엔드포인트 추가
+class PROResponse(BaseModel):
+    user_id: str
+    response: dict
+
+@app.post("/pro-responses")
+async def create_pro_response(request: PROResponse):
+    """PRO 설문 응답을 받아 pro_responses 테이블에 저장"""
+    try:
+        insert_res = supabase.table("pro_responses").insert({
+            "user_id": request.user_id,
+            "response": request.response
+        }).execute()
+        pro_id = insert_res.data[0]["id"]
+        return {"status": "success", "id": pro_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PRO 응답 저장 오류: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
