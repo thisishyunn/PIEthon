@@ -12,6 +12,10 @@ app = FastAPI()
 
 # client.api_key = "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"
 
+@app.get("/ping")
+async def ping():
+    return {"message": "pong"}
+
 @app.post("/extract")
 async def extract_pdf(file: UploadFile = File(...), password: str = Form(...)):
     try:
