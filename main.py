@@ -4,13 +4,20 @@ from PyPDF2 import PdfReader
 import os
 import glob
 from openai import OpenAI
-client = OpenAI(api_key="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")
-
+import json
+from pydantic import BaseModel
+from typing import Optional
+from dotenv import load_dotenv
+from supabase import create_client, Client
+load_dotenv()
 app = FastAPI()
 
-# openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# client.api_key = "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"
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+supabase: Client = create_client(supabase_url, supabase_key)
 
 @app.get("/ping")
 async def ping():
@@ -60,6 +67,170 @@ async def health_report():
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"건강 보고서 생성 중 오류 발생: {str(e)}")
+
+class FHIRIngestRequest(BaseModel):
+    name_hash: str
+    full_name: Optional[str] = None
+    resource: dict
+
+@app.post("/ingest-fhir")
+async def ingest_fhir(request: FHIRIngestRequest):
+    try:
+        # 1) 사용자 조회 또는 생성
+        user_resp = supabase.table("users").select("id").eq("name_hash", request.name_hash).execute()
+        if user_resp.data:
+            user_id = user_resp.data[0]["id"]
+        else:
+            insert_user = supabase.table("users").insert({"name_hash": request.name_hash, "full_name": request.full_name}).execute()
+            user_id = insert_user.data[0]["id"]
+
+        # 2) 원본 FHIR 리소스 저장 및 매핑 (publicData 처리)
+        raw = request.resource
+        # publicData 배열이 있으면 여러 리소스 처리, 없으면 단일 리소스로 처리
+        resources = []
+        if isinstance(raw.get("publicData"), list):
+            for item in raw["publicData"]:
+                if isinstance(item, dict) and "resource" in item:
+                    resources.append(item["resource"])
+        else:
+            resources.append(raw)
+
+        results = []
+        for res in resources:
+            resource_type = res.get("resourceType")
+            fhir_id_val = res.get("id")
+            # 원본 리소스 저장
+            insert_fhir = supabase.table("fhir_resources").insert({
+                "user_id": user_id,
+                "resource_type": resource_type,
+                "fhir_id": fhir_id_val,
+                "data": res
+            }).execute()
+            resource_id = insert_fhir.data[0]["id"]
+
+            # 리소스 타입별 매핑
+            if resource_type == "MedicationDispense":
+                # medication 정보
+                med_ref = res.get("medicationReference", {})
+                med_res = med_ref.get("resource", {})
+                coding = med_res.get("code", {}).get("coding", [{}])[0]
+                medication_code = coding.get("code")
+                print("medication_code", medication_code)
+                medication_name = coding.get("display")
+                print("medication_name", medication_name)
+                # pharmacy name 추출 (performer 배열의 actor.resource.name)
+                pharmacy_name = None
+                perf = res.get("performer", [])
+                if isinstance(perf, list) and perf:
+                    actor = perf[0].get("actor", {})
+                    org = actor.get("resource", {})
+                    pharmacy_name = org.get("name")
+                print("pharmacy_name", pharmacy_name)
+                when_prepared = res.get("whenPrepared", "").split("T")[0]
+                print("when_prepared", when_prepared)
+                days_supply = res.get("daysSupply", {}).get("value")
+
+                print({
+                    "user_id": user_id,
+                    "resource_id": resource_id,
+                    "medication_code": medication_code,
+                    "medication_name": medication_name,
+                    "pharmacy_name": pharmacy_name,
+                    "when_prepared": when_prepared,
+                    "days_supply": days_supply,
+                })
+
+                insert_md = supabase.table("medication_dispenses").insert({
+                    "user_id": user_id,
+                    "resource_id": resource_id,
+                    "medication_code": medication_code,
+                    "medication_name": medication_name,
+                    "pharmacy_name": pharmacy_name,
+                    "when_prepared": when_prepared,
+                    "days_supply": days_supply,
+                }).execute()
+            elif resource_type == "ExplanationOfBenefit":
+                claim_type_coding = res.get("type", {}).get("coding", [{}])[0]
+                claim_type = claim_type_coding.get("code") or claim_type_coding.get("display")
+                # created_date: billablePeriod.start 우선 사용
+                billable = res.get("billablePeriod", {})
+                created_date = billable.get("start", res.get("created", "")).split("T")[0]
+                copay_amount = None
+                benefit_amount = None
+                totals = res.get("total", [])
+                if isinstance(totals, list):
+                    for t in totals:
+                        cat = t.get("category", {}).get("coding", [{}])[0]
+                        code_key = cat.get("code")
+                        val = t.get("amount", {}).get("value")
+                        if code_key == "copay":
+                            copay_amount = val
+                        elif code_key == "benefit":
+                            benefit_amount = val
+                insert_tc = supabase.table("treatment_claims").insert({
+                    "user_id": user_id,
+                    "resource_id": resource_id,
+                    "claim_type": claim_type,
+                    "created_date": created_date,
+                    "copay_amount": copay_amount,
+                    "benefit_amount": benefit_amount
+                }).execute()
+            elif resource_type == "Immunization":
+                vc = res.get("vaccineCode", {}).get("coding", [{}])[0]
+                vaccine_name = vc.get("display")
+                occurrence_date = res.get("occurrenceDateTime", "").split("T")[0]
+                # dose number 체크
+                dose_number = res.get("doseNumber")
+                if not dose_number:
+                    prot = res.get("protocolApplied", [])
+                    if isinstance(prot, list) and prot:
+                        dose_number = prot[0].get("doseNumberPositiveInt") or prot[0].get("doseNumber")
+
+                # performer name
+                perf_name = None
+                p_list = res.get("performer", [])
+                if isinstance(p_list, list) and p_list:
+                    actor = p_list[0].get("actor", {})
+                    org = actor.get("resource", {})
+                    perf_name = org.get("name")
+
+                insert_im = supabase.table("immunizations").insert({
+                    "user_id": user_id,
+                    "resource_id": resource_id,
+                    "vaccine_name": vaccine_name,
+                    "occurrence_date": occurrence_date,
+                    "dose_number": dose_number,
+                    "performer_name": perf_name
+                }).execute()
+            else:
+                # 지원하지 않는 리소스 타입은 건너뜀
+                continue
+
+            results.append({"resource_type": resource_type, "resource_id": resource_id})
+
+        return {"status": "success", "user_id": user_id, "results": results}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/debug/clear-data")
+async def clear_data():
+    """디버깅용: users 테이블을 제외한 모든 데이터 삭제"""
+    try:
+        tables = [
+            "medication_dispenses",
+            "treatment_claims",
+            "immunizations",
+            "fhir_resources",
+        ]
+        results = {}
+        for tbl in tables:
+            res = supabase.table(tbl).delete().neq("id", 0).execute()
+            results[tbl] = len(res.data) if res.data else 0
+        return {"status": "cleared", "deleted_rows": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"데이터 삭제 오류: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
