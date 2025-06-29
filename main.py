@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 import io
 from PyPDF2 import PdfReader
 import os
@@ -515,35 +515,98 @@ async def create_pro_response(request: PROResponse):
         raise HTTPException(status_code=500, detail=f"PRO 응답 저장 오류: {str(e)}")
 
 @app.get("/export-data")
-async def export_data():
-    """PRO 응답과 EHR(예방접종, 투약, 청구) 데이터를 하나의 Excel 파일로 다운로드"""
+async def export_data(
+    min_age: Optional[int]      = Query(None, description="medication_dispenses age >= min_age"),
+    max_age: Optional[int]      = Query(None, description="medication_dispenses age <= max_age"),
+    med_codes: Optional[List[str]] = Query(None, description="filter medication_code list"),
+    is_csv: bool                 = Query(False, description="CSV 출력 여부"),
+):
+    """PRO 응답과 EHR(예방접종, 투약, 청구) 데이터를 CSV 또는 Excel로 다운로드"""
     try:
         # PRO responses
         pro_resp = supabase.table("pro_responses").select("*").execute()
         pro_rows = pro_resp.data or []
         # PRO 응답의 hashed user_id 목록
         hashed_ids = list({r.get("user_id") for r in pro_rows if r.get("user_id")})
-        # users 테이블에서 hashed name_hash -> 정수 id 매핑
+        # users 매핑
         users_map_resp = supabase.table("users").select("id, name_hash").in_("name_hash", hashed_ids).execute()
         mapping = {u.get("name_hash"): u.get("id") for u in (users_map_resp.data or [])}
-        # EHR 조회용 integer user_id 리스트
         ehr_user_ids = [mapping[h] for h in hashed_ids if mapping.get(h) is not None]
 
-        # EHR tables
-        immun_resp = supabase.table("immunizations").select("*").in_("user_id", ehr_user_ids).execute()
-        meds_resp = supabase.table("medication_dispenses").select("*").in_("user_id", ehr_user_ids).execute()
-        tc_resp   = supabase.table("treatment_claims").select("*").in_("user_id", ehr_user_ids).execute()
-        immun_rows = immun_resp.data or []
-        meds_rows  = meds_resp.data or []
-        tc_rows    = tc_resp.data or []
+        # EHR 데이터 조회
+        immun_rows = meds_rows = tc_rows = []
+        if ehr_user_ids:
+            immun_rows = (supabase.table("immunizations").select("*").in_("user_id", ehr_user_ids).execute().data or [])
+            meds_q = supabase.table("medication_dispenses").select("*").in_("user_id", ehr_user_ids)
+            if min_age is not None: meds_q = meds_q.gte("age", min_age)
+            if max_age is not None: meds_q = meds_q.lte("age", max_age)
+            if med_codes:        meds_q = meds_q.in_("medication_code", med_codes)
+            meds_rows = (meds_q.execute().data or [])
+            tc_rows  = (supabase.table("treatment_claims").select("*").in_("user_id", ehr_user_ids).execute().data or [])
 
-        # DataFrame 생성
+        # CSV 출력
+        if is_csv:
+            # 해시된 user_id -> 정수 id 매핑 리스트
+            pairs = [(h, mapping[h]) for h in hashed_ids if h in mapping]
+            # aggregator keyed by 정수 user_id
+            agg = {uid: {"response": None, "immun": [], "meds": [], "tc": []} for _, uid in pairs}
+            # PRO 응답 채우기
+            for r in pro_rows:
+                h = r.get("user_id")
+                uid = mapping.get(h)
+                if uid in agg:
+                    agg[uid]["response"] = r.get("response")
+            # EHR 데이터 채우기
+            for r in immun_rows:
+                uid = r.get("user_id")
+                if uid in agg:
+                    agg[uid]["immun"].append(r)
+            for r in meds_rows:
+                uid = r.get("user_id")
+                if uid in agg:
+                    agg[uid]["meds"].append(r)
+            for r in tc_rows:
+                uid = r.get("user_id")
+                if uid in agg:
+                    agg[uid]["tc"].append(r)
+            # 최대 길이 계산
+            max_im = max((len(v["immun"]) for v in agg.values()), default=0)
+            max_md = max((len(v["meds"])  for v in agg.values()), default=0)
+            max_tc = max((len(v["tc"])    for v in agg.values()), default=0)
+            # 컬럼명 생성
+            cols = ["user_id", "response"]
+            cols += [f"immun_{i+1}" for i in range(max_im)]
+            cols += [f"meds_{i+1}"   for i in range(max_md)]
+            cols += [f"tc_{i+1}"     for i in range(max_tc)]
+            # 행 생성
+            rows = []
+            for uid in agg:
+                row = {"user_id": uid, "response": json.dumps(agg[uid]["response"], ensure_ascii=False)}
+                for i in range(max_im):
+                    val = agg[uid]["immun"][i] if i < len(agg[uid]["immun"]) else None
+                    row[f"immun_{i+1}"] = json.dumps(val, ensure_ascii=False) if val is not None else ""
+                for i in range(max_md):
+                    val = agg[uid]["meds"][i] if i < len(agg[uid]["meds"]) else None
+                    row[f"meds_{i+1}"]   = json.dumps(val, ensure_ascii=False) if val is not None else ""
+                for i in range(max_tc):
+                    val = agg[uid]["tc"][i]   if i < len(agg[uid]["tc"])   else None
+                    row[f"tc_{i+1}"]     = json.dumps(val, ensure_ascii=False) if val is not None else ""
+                rows.append(row)
+            df_flat = pd.DataFrame(rows, columns=cols)
+            buf = BytesIO()
+            df_flat.to_csv(buf, index=False, encoding='utf-8-sig')
+            buf.seek(0)
+            return StreamingResponse(
+                buf,
+                media_type='text/csv',
+                headers={"Content-Disposition": "attachment; filename=export.csv"},
+            )
+
+        # Excel 출력 (4개 시트)
         df_pro   = pd.DataFrame(pro_rows)
         df_immun = pd.DataFrame(immun_rows)
         df_meds  = pd.DataFrame(meds_rows)
         df_tc    = pd.DataFrame(tc_rows)
-
-        # Excel 파일 작성
         buf = BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df_pro.to_excel(writer, index=False, sheet_name="PRO Responses")
@@ -551,12 +614,7 @@ async def export_data():
             df_meds.to_excel(writer, index=False, sheet_name="MedicationDispenses")
             df_tc.to_excel(writer, index=False, sheet_name="TreatmentClaims")
         buf.seek(0)
-        headers = {"Content-Disposition": "attachment; filename=export.xlsx"}
-        return StreamingResponse(
-            buf,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers=headers,
-        )
+        return StreamingResponse(buf, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers={"Content-Disposition":"attachment; filename=export.xlsx"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export 오류: {str(e)}")
 
