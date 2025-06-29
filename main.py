@@ -531,16 +531,19 @@ async def export_data(
         # users 매핑
         users_map_resp = supabase.table("users").select("id, name_hash").in_("name_hash", hashed_ids).execute()
         mapping = {u.get("name_hash"): u.get("id") for u in (users_map_resp.data or [])}
+        print("mapping", mapping)
         ehr_user_ids = [mapping[h] for h in hashed_ids if mapping.get(h) is not None]
-
+        print("ehr_user_ids", ehr_user_ids)
         # EHR 데이터 조회
         immun_rows = meds_rows = tc_rows = []
         if ehr_user_ids:
             immun_rows = (supabase.table("immunizations").select("*").in_("user_id", ehr_user_ids).execute().data or [])
+            print("immun_rows", immun_rows)
             meds_q = supabase.table("medication_dispenses").select("*").in_("user_id", ehr_user_ids)
+            print("meds_q", meds_q)
             if min_age is not None: meds_q = meds_q.gte("age", min_age)
             if max_age is not None: meds_q = meds_q.lte("age", max_age)
-            if med_codes:        meds_q = meds_q.in_("medication_code", med_codes)
+            if med_codes:        meds_q = meds_q.in_("medication_name", med_codes)
             meds_rows = (meds_q.execute().data or [])
             tc_rows  = (supabase.table("treatment_claims").select("*").in_("user_id", ehr_user_ids).execute().data or [])
 
